@@ -1,0 +1,227 @@
+from notebookutils import mssparkutils
+from azure.storage.blob import BlobServiceClient
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, sha2, concat_ws, current_timestamp, row_number, desc
+from pyspark.sql.types import IntegerType, BooleanType
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+from datetime import datetime
+import io
+import pandas as pd
+ 
+
+spark = SparkSession.builder.getOrCreate()
+ 
+
+key_vault_uri = 'https://azeusprod-i2-kv.vault.azure.net/'
+secret_name = 'SCPO-StorageConnectionString'
+connection_string = mssparkutils.credentials.getSecret(key_vault_uri, secret_name)
+container_name = "scpo-files-storage"
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+container_client = blob_service_client.get_container_client(container_name)
+ 
+
+table_configs = {
+    "schedrcpts": {
+        "primary_keys": ["item", "loc", "scheddate", "expdate", "startdate", "seqnum", "supplyid"],
+        "temp_table": "schedrcpts_temp",
+        "target_table": "schedrcpts"
+    },
+    "recship": {
+        "primary_keys": ["item", "source", "dest", "type", "seqnum"],
+        "temp_table": "recship_temp",
+        "target_table": "recship"
+    },
+    "item": {
+        "primary_keys": ["item"],
+        "temp_table": "item_temp",
+        "target_table": "item"
+    },
+    "vehicleloadline": {
+        "primary_keys": ["loadid", "primaryitem", "expdate", "item", "dest","supplyid"],
+        "temp_table": "vehicleloadline_temp",
+        "target_table": "vehicleloadline"
+    }
+ }
+ 
+log_entries = []
+ 
+def scd2_merge(target_table_name, df_source, primary_keys):
+     try:
+         load_datetime_col = 'LoadDateTime'
+         all_columns = df_source.columns
+         compare_columns = [c for c in all_columns if c not in primary_keys + [load_datetime_col]]
+ 
+         window_spec = Window.partitionBy(*primary_keys).orderBy(desc(load_datetime_col))
+         df_source_latest = (
+             df_source
+             .withColumn("row_num", row_number().over(window_spec))
+             .filter("row_num = 1")
+             .drop("row_num")
+         )
+ 
+         if spark.catalog.tableExists(target_table_name):
+             delta_table = DeltaTable.forName(spark, target_table_name)
+             df_target = delta_table.toDF()
+ 
+             join_cond = [df_source_latest[k] == df_target[k] for k in primary_keys]
+             df_joined = df_source_latest.alias("src").join(df_target.alias("tgt"), join_cond, "left")
+ 
+             df_changed = df_joined.filter(
+                 (sha2(concat_ws("|", *[col(f"src.{c}") for c in compare_columns]), 256) !=
+                  sha2(concat_ws("|", *[col(f"tgt.{c}") for c in compare_columns]), 256)) |
+                 (col(f"tgt.{primary_keys[0]}").isNull())
+             ).select("src.*")
+ 
+             if not df_changed.rdd.isEmpty():
+                 merge_condition = " AND ".join([f"tgt.{k} = src.{k}" for k in primary_keys])
+                 delta_table.alias("tgt").merge(
+                     df_changed.alias("src"),
+                     merge_condition
+                 ).whenMatchedUpdate(
+                     condition="tgt.active_flag = 1",
+                     set={
+                         "active_flag": lit(0).cast("int"),
+                         "isdeleted": lit(False)
+                     }
+                 ).execute()
+ 
+                 df_to_insert = (
+                     df_changed
+                     .withColumn("active_flag", lit(1).cast(IntegerType()))
+                     .withColumn("isdeleted", lit(False).cast(BooleanType()))
+                 )
+                 df_to_insert.write.format("delta").mode("append").saveAsTable(target_table_name)
+ 
+             df_not_in_source = df_target.alias("tgt") \
+                 .join(df_source_latest.alias("src"), on=primary_keys, how="left_anti") \
+                 .filter("tgt.active_flag = 1 AND tgt.isdeleted = false")
+ 
+             if not df_not_in_source.rdd.isEmpty():
+                 merge_condition = " AND ".join([f"tgt.{k} = src.{k}" for k in primary_keys])
+                 delta_table.alias("tgt").merge(
+                     df_not_in_source.alias("src"),
+                     merge_condition
+                 ).whenMatchedUpdate(
+                     set={
+                         "active_flag": lit(0).cast("int"),
+                         "isdeleted": lit(True)
+                     }
+                 ).execute()
+ 
+         else:
+             df_source_latest \
+                 .withColumn("active_flag", lit(1).cast(IntegerType())) \
+                 .withColumn("isdeleted", lit(False).cast(BooleanType())) \
+                 .write.format("delta") \
+                 .mode("overwrite") \
+                 .saveAsTable(target_table_name)
+ 
+     except Exception as e:
+         current_time = datetime.now()
+         return f"Exception occurred while processing SCD2 on TargetTable {target_table_name}: {str(e)} on {current_time}"
+ 
+
+allowed_prefixes = set(table_configs.keys())
+
+blobs_list = container_client.list_blobs()
+for blob in blobs_list:
+    try:
+        blob_name = blob.name
+        blob_prefix = blob_name.split("_")[0].lower()
+
+        if blob_prefix not in allowed_prefixes:
+            print(f"Skipping unrelated blob: {blob_name}")
+            continue
+
+        print(f"Processing blob: {blob.name}")
+        
+        blob_client = container_client.get_blob_client(blob.name)
+        blob_data = blob_client.download_blob().readall()
+        data = pd.read_parquet(io.BytesIO(blob_data))
+        
+        print(data.head())
+        
+        file_record_count = data.shape[0]
+        df = spark.createDataFrame(data)
+        df = df.select([col(c).cast("string").alias(c.replace(" ", "_")) for c in df.columns])
+        # df = df.select([col(c).cast("string").alias(c.strip().lower().replace(" ", "_")) for c in df.columns])
+ 
+        table_key = blob.name.split("_")[0].lower()
+        if table_key not in table_configs:
+            raise Exception(f"Table config not found for prefix: {table_key}")
+
+        table_conf = table_configs[table_key]
+        primary_keys = table_conf["primary_keys"]
+        temp_table = table_conf["temp_table"]
+        target_table = table_conf["target_table"]
+
+        df = df.withColumn("HashKey", sha2(concat_ws("|", *[col(c) for c in primary_keys]), 256)) \
+                .withColumn("SourceSystemId", lit(42)) \
+                .withColumn("LoadDateTime", current_timestamp())
+
+        if spark.catalog.tableExists(temp_table):
+            spark.sql(f"DROP TABLE {temp_table}")
+
+        df.write.format("delta") \
+            .mode("overwrite") \
+            .option("delta.enableChangeDataFeed", "true") \
+            .saveAsTable(temp_table)
+
+        source_df = spark.read.table(temp_table)
+        source_table_count = source_df.count()
+
+        result = scd2_merge(target_table, source_df, primary_keys)
+        after_scd2_record_count = source_df.count()
+
+        blob_client.delete_blob()
+        print(f"Successfully processed and deleted: {blob.name}")
+        
+        blob_size = blob.size  
+        if blob_size >= 1024 * 1024:
+            size = blob_size / (1024 * 1024)
+            unit = "MB"
+        elif blob_size >= 1024:
+            size = blob_size / 1024
+            unit = "KB"
+        else:
+            size = blob_size
+            unit = "bytes"
+        readable_blob_size = f"{size:.2f} {unit}"
+
+        print(f"Blob size: {size:.2f} {unit}")
+
+        log_entries.append({
+            "blob_name": blob.name,
+            "table_name": temp_table,
+            "target_table": target_table,
+            "status": "Success",
+            "file_record_count": file_record_count,  
+            "source_record_count": source_table_count,  
+            "target_record_count": after_scd2_record_count,  
+            "blob_size": readable_blob_size, 
+            "message": "Data written, SCD2 applied, and blob deleted",
+            "timestamp": str(datetime.now())
+        })
+
+    except Exception as e:
+        print(f"Error processing blob {blob.name}: {e}")
+        log_entries.append({
+            "blob_name": blob.name,
+            "table_name": table_conf["temp_table"] if 'table_conf' in locals() else "Unknown",
+            "target_table": table_conf["target_table"] if 'table_conf' in locals() else "Unknown",
+            "status": "Failed",
+            "file_record_count": file_record_count if 'file_record_count' in locals() else 0,
+            "source_record_count": source_table_count if 'source_table_count' in locals() else 0,
+            "target_record_count": after_scd2_record_count if 'after_scd1_record_count' in locals() else 0,
+            "blob_size": readable_blob_size if 'readable_blob_size' in locals() else "0 bytes",
+            "message": str(e),
+            "timestamp": str(datetime.now())
+        })
+ 
+if log_entries:
+     log_df = spark.createDataFrame(log_entries)
+     log_df.write.mode("append").format("delta").option("mergeSchema", "true").saveAsTable("table_logs")
+     print("Logs written to table_logs.")
+ 
+print("Blob processing and SCD2 operations completed for all tables.")
