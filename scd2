@@ -172,7 +172,7 @@ for blob in blobs_list:
         source_table_count = source_df.count()
 
         result = scd2_merge(target_table, source_df, primary_keys)
-        after_scd2_record_count = source_df.count()
+        after_scd2_record_count = spark.read.table(target_table).count()
 
         blob_client.delete_blob()
         print(f"Successfully processed and deleted: {blob.name}")
